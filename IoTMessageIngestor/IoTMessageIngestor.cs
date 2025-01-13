@@ -1,10 +1,6 @@
 using IoTHubTrigger = Microsoft.Azure.WebJobs.EventHubTriggerAttribute;
 
 using Microsoft.Azure.WebJobs;
-using Microsoft.Azure.WebJobs.Host;
-using Microsoft.Azure.EventHubs;
-using System.Text;
-using System.Net.Http;
 using Microsoft.Extensions.Logging;
 using Microsoft.Data.SqlClient;
 using Newtonsoft.Json;
@@ -37,58 +33,81 @@ namespace Azure.RUS
 
         [FunctionName("SaveTelemetryToDBFunction")]
         public static void SaveTelemetryToDB(
-            [EventHubTrigger(eventHubName, Connection = "EventHubConnectionString")] string msg,
+            [IoTHubTrigger(eventHubName, Connection = "EventHubConnectionString")] string msg,
             ILogger logger)
         {
             if (!string.IsNullOrEmpty(msg))
             {
-                using (SqlConnection conn = new SqlConnection(databaseConnectionString))
+                using SqlConnection conn = new SqlConnection(databaseConnectionString);
+                conn.Open();
+
+                if (msg.StartsWith("Device"))
                 {
-                    conn.Open();
-
-                    if (msg.StartsWith("Device"))
-                    {
-                        logger.LogInformation($"Info: Received IsAlive message: {msg}");
-
-                        string query = "UPDATE Device SET LastOnline = getdate() WHERE Name=@DeviceName";
-                        using (SqlCommand cmd = new SqlCommand(query, conn))
-                        {
-                            cmd.Parameters.Add(new SqlParameter("DeviceName", msg));
-
-                            var rows = cmd.ExecuteNonQuery();
-                            logger.LogInformation($"{rows} rows were updated");
-                        }
-                    }
-                    else
-                    {
-                        logger.LogInformation($"Info: Received telemetry message: {msg}");
-                        MessageBody messageBody = JsonConvert.DeserializeObject<MessageBody>(msg);
-
-                        string insertAmbientQuery = "INSERT INTO Measurement (DateTime, Temperature, Humidity, Luminance, DeviceID) VALUES (GETDATE(), @Temperature, @Humidity, @Luminance, @DeviceID);";
-                        string insertSentimentQuery = "INSERT INTO OwnerSentiment (Status, DateTime, DeviceID) VALUES (@Status, GETDATE(), @DeviceID);";
-                        using (SqlCommand cmd = new SqlCommand(insertAmbientQuery, conn))
-                        {
-                            cmd.Parameters.Add(new SqlParameter("DeviceID", messageBody.DeviceID));
-                            cmd.Parameters.Add(new SqlParameter("Temperature", messageBody.Ambient.Temperature));
-                            cmd.Parameters.Add(new SqlParameter("Humidity", messageBody.Ambient.Humidity));
-                            cmd.Parameters.Add(new SqlParameter("Luminance", messageBody.Ambient.Light));
-
-                            var rows = cmd.ExecuteNonQuery();
-                            logger.LogInformation($"{rows} rows were updated");
-                        }
-
-                        using (SqlCommand cmd = new SqlCommand(insertSentimentQuery, conn))
-                        {
-                            cmd.Parameters.Add(new SqlParameter("Status", messageBody.Sentiment.Status));
-                            cmd.Parameters.Add(new SqlParameter("DeviceID", messageBody.DeviceID));
-
-                            var rows = cmd.ExecuteNonQuery();
-                            logger.LogInformation($"{rows} rows were updated");
-                        }
-                    }
-
-                    conn.Close();
+                    ProcessIsAliveMessage(conn, msg, logger);
                 }
+                else
+                {
+                    ProcessTelemetryMessage(conn, msg, logger);
+                }
+
+                conn.Close();
+            }
+        }
+
+        private static void ProcessIsAliveMessage(SqlConnection conn, string msg, ILogger logger)
+        {
+            logger.LogInformation($"Info: Received IsAlive message: {msg}");
+
+            string query = "UPDATE Device SET LastOnline = GETDATE() WHERE Name = @DeviceName";
+            using (SqlCommand cmd = new SqlCommand(query, conn))
+            {
+                cmd.Parameters.Add(new SqlParameter("DeviceName", msg));
+                int rows = cmd.ExecuteNonQuery();
+                logger.LogInformation($"{rows} rows were updated for IsAlive message.");
+            }
+        }
+
+        private static void ProcessTelemetryMessage(SqlConnection conn, string msg, ILogger logger)
+        {
+            logger.LogInformation($"Info: Received telemetry message: {msg}");
+            var messageBody = JsonConvert.DeserializeObject<MessageBody>(msg);
+
+            if (messageBody == null)
+            {
+                logger.LogWarning("Message deserialization returned null.");
+                return;
+            }
+
+            using (var transaction = conn.BeginTransaction())
+            {
+                string insertAmbientQuery = @"
+                    INSERT INTO Measurement (DateTime, Temperature, Humidity, Luminance, DeviceID) 
+                    VALUES (GETDATE(), @Temperature, @Humidity, @Luminance, @DeviceID);";
+
+                string insertSentimentQuery = @"
+                    INSERT INTO OwnerSentiment (Status, DateTime, DeviceID) 
+                    VALUES (@Status, GETDATE(), @DeviceID);";
+
+                using (SqlCommand cmd = new SqlCommand(insertAmbientQuery, conn, transaction))
+                {
+                    cmd.Parameters.AddWithValue("Temperature", messageBody.Ambient.Temperature);
+                    cmd.Parameters.AddWithValue("Humidity", messageBody.Ambient.Humidity);
+                    cmd.Parameters.AddWithValue("Luminance", messageBody.Ambient.Light);
+                    cmd.Parameters.AddWithValue("DeviceID", messageBody.DeviceID);
+
+                    cmd.ExecuteNonQuery();
+                }
+
+                using (SqlCommand cmd = new SqlCommand(insertSentimentQuery, conn, transaction))
+                {
+                    cmd.Parameters.AddWithValue("Status", messageBody.Sentiment.Status);
+                    cmd.Parameters.AddWithValue("DeviceID", messageBody.DeviceID);
+
+                    cmd.ExecuteNonQuery();
+                }
+
+                transaction.Commit();
+                logger.LogInformation("Telemetry data saved successfully.");
             }
         }
     }
