@@ -1,9 +1,9 @@
-using IoTHubTrigger = Microsoft.Azure.WebJobs.EventHubTriggerAttribute;
-
-using Microsoft.Azure.WebJobs;
+using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
 using Microsoft.Data.SqlClient;
-using Newtonsoft.Json;
+using System.Text.Json;
+using Azure.Messaging.EventHubs;
+using System.Text;
 
 namespace Azure.RUS
 {
@@ -26,16 +26,16 @@ namespace Azure.RUS
         public int Light { get; set; }
     }
 
-    public class IoTMessageIngestor
+    public class IoTMessageIngestor(ILogger<IoTMessageIngestor> logger)
     {
         const string eventHubName = "<eventHubName>";
         const string databaseConnectionString = "<dbConnString>";
 
-        [FunctionName("SaveTelemetryToDBFunction")]
-        public static void SaveTelemetryToDB(
-            [IoTHubTrigger(eventHubName, Connection = "EventHubConnectionString")] string msg,
-            ILogger logger)
+        [Function("SaveTelemetryToDB")]
+        public void SaveTelemetryToDB(
+            [EventHubTrigger(eventHubName, Connection = "EventHubConnectionString")] string[] data, FunctionContext context)
         {
+            string msg = data[0];
             if (!string.IsNullOrEmpty(msg))
             {
                 using SqlConnection conn = new SqlConnection(databaseConnectionString);
@@ -43,18 +43,18 @@ namespace Azure.RUS
 
                 if (msg.StartsWith("Device"))
                 {
-                    ProcessIsAliveMessage(conn, msg, logger);
+                    ProcessIsAliveMessage(conn, msg);
                 }
                 else
                 {
-                    ProcessTelemetryMessage(conn, msg, logger);
+                    ProcessTelemetryMessage(conn, msg);
                 }
 
                 conn.Close();
             }
         }
 
-        private static void ProcessIsAliveMessage(SqlConnection conn, string msg, ILogger logger)
+        private void ProcessIsAliveMessage(SqlConnection conn, string msg)
         {
             logger.LogInformation($"Info: Received IsAlive message: {msg}");
 
@@ -66,11 +66,11 @@ namespace Azure.RUS
                 logger.LogInformation($"{rows} rows were updated for IsAlive message.");
             }
         }
-
-        private static void ProcessTelemetryMessage(SqlConnection conn, string msg, ILogger logger)
+        
+        private void ProcessTelemetryMessage(SqlConnection conn, string msg)
         {
             logger.LogInformation($"Info: Received telemetry message: {msg}");
-            var messageBody = JsonConvert.DeserializeObject<MessageBody>(msg);
+            var messageBody = JsonSerializer.Deserialize<MessageBody>(msg);
 
             if (messageBody == null)
             {
